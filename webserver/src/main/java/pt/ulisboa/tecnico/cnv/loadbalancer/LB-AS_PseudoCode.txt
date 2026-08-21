@@ -1,0 +1,98 @@
+MAX_COMPLEXITY_PER_VM = 2000000000 // Max instructions for a VM
+SCALE_UP_THRESHOLD = 0.80          
+SCALE_DOWN_THRESHOLD = 0.30        
+COOLDOWN_PERIOD_SECS = 60
+
+Function auto_scaler_loop():
+    last_action_time = get_current_time()
+
+    While True:
+        sleep(10 seconds)
+        
+        If (get_current_time() - last_action_time) < COOLDOWN_PERIOD_SECS:
+            continue
+            
+        Lock(active_vms_mutex):
+            total_vms = length(active_vms) + length(pending_vms)
+
+            // Prevent division by zero if there are no VMs
+            if total_vms == 0:
+                start_thread(launch_new_vm())
+                last_action_time = get_current_time()
+                continue
+
+            total_system_capacity = total_vms * MAX_COMPLEXITY_PER_VM
+            total_current_workload = sum(vm.estimated_workload_in_flight for vm in active_vms)
+            load_percentage = total_current_workload / total_system_capacity
+
+            // Scaling up
+            If load_percentage > SCALE_UP_THRESHOLD:
+                // Calls AWS SDK
+                start_thread(launch_new_vm())
+                last_action_time = get_current_time()
+
+            // Scale down
+            Else if load_percentage < SCALE_DOWN_THRESHOLD and total_vms > 1:                
+                // Find the VM with the least amount of work
+                WorkerNode vm_to_terminate = find_least_busy_vm(active_vms)
+                
+                // Remove from the active list
+                active_vms.remove(vm_to_terminate)
+                
+                // Wait for current requests to finish before terminating
+                start_thread(terminate(vm_to_terminate))
+                last_action_time = get_current_time()
+
+Function launch_new_vm():
+    increment(pending_vms_count)
+    new_vm_ip = aws_ec2_launch_instance() 
+    wait_for_vm_to_boot(new_vm_ip)
+    
+    new_worker = WorkerNode(ip_address: new_vm_ip, workload: 0)
+    
+    Lock(active_vms_mutex):
+        active_vms.append(new_worker)
+        decrement(pending_vms_count)
+
+
+Function terminate(vm):
+    While vm.current_active_requests > 0:
+        sleep(5 seconds) // Wait for requests to finish
+    aws_ec2_terminate_instance(vm.instance_id) // Calls AWS SDK
+
+
+Function handle_incoming_request(request):
+    // Estimate complexity with MSS
+    estimated_complexity = query_mss_for_estimate(request.type, request.parameters)
+
+    Lock(active_vms_mutex):
+        // Filter out VMs that are overloaded
+        available_vms = []
+        for vm in active_vms:
+            if (vm.estimated_workload_in_flight + estimated_complexity) <= MAX_COMPLEXITY_PER_VM:
+                available_vms.append(vm)
+
+        // Routing decision
+        If length(available_vms) == 0:
+            // if EC2 instances are full or booting, send to Lambda
+            Release(active_vms_mutex)
+            result = invoke_lambda_faas(request)
+            return result
+        Else:
+            // Pick the VM with the lowest current workload
+            chosen_vm = find_least_busy_vm(available_vms)
+            
+            // Let the AutoScaler knows about the work in flight
+            chosen_vm.estimated_workload_in_flight += estimated_complexity
+            chosen_vm.current_active_requests += 1
+
+    // Forward request to chosen EC2 VM
+    result = forward_to_ec2(chosen_vm.ip_address, request)
+
+    // Cleanup after request finishes
+    Lock(active_vms_mutex):
+        chosen_vm.estimated_workload_in_flight -= estimated_complexity
+        chosen_vm.current_active_requests -= 1
+        
+    // Save execution metrics to MSS for future estimates
+    return result

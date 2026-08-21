@@ -1,0 +1,7 @@
+/scripts/config.sh
+
+**/target/
+
+/scripts/mykeypair.pem
+
+/.idea
